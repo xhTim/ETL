@@ -15,6 +15,10 @@ process.MessageLogger = cms.Service("MessageLogger",
     cout=cms.untracked.PSet(threshold=cms.untracked.string("INFO")),
 )
 
+process.TFileService = cms.Service("TFileService",
+    fileName = cms.string("etl_primary_simhit_spreads.root")
+)
+
 process.mtdSimHitPrimary = cms.EDAnalyzer("MTDSimHitPrimaryAnalyzer",
     etlSimHits   = cms.InputTag("g4SimHits", "FastTimerHitsEndcap", "SIM"),
     btlSimHits   = cms.InputTag("g4SimHits", "FastTimerHitsBarrel", "SIM"),
