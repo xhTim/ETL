@@ -12,11 +12,11 @@
 #include "SimDataFormats/Track/interface/SimTrackContainer.h"
 #include "SimDataFormats/Vertex/interface/SimVertexContainer.h"
 
+#include "SimG4CMS/Forward/interface/MtdHitCategory.h"
+
 #include "TH1D.h"
-#include "TH2D.h"
 
 #include <algorithm>
-#include <cmath>
 #include <unordered_map>
 #include <vector>
 
@@ -24,32 +24,29 @@ class MTDSimHitPrimaryAnalyzer : public edm::one::EDAnalyzer<> {
 public:
   explicit MTDSimHitPrimaryAnalyzer(const edm::ParameterSet&);
   void analyze(const edm::Event&, const edm::EventSetup&) override;
+  void endJob() override;
 
 private:
   struct TrackAccum {
-    unsigned nETL = 0;
+    unsigned nETL = 0;   // counts only PDG-matched primary-associated ETL hits
     double tMin = 1e99;
     double tMax = -1e99;
     bool hasHit = false;
-
-    // local-position proxy (midpoint of entry/exit in local coords)
-    double x0 = 0., y0 = 0., z0 = 0.;
-    bool hasRefPos = false;
-    double maxDrLocalFromFirst = 0.;
-    double zLocalMin = 1e99;
-    double zLocalMax = -1e99;
   };
 
   edm::EDGetTokenT<std::vector<PSimHit>> tokETL_;
-  edm::EDGetTokenT<std::vector<PSimHit>> tokBTL_;  // keep interface, do not count
+  edm::EDGetTokenT<std::vector<PSimHit>> tokBTL_;  // kept for interface stability
   edm::EDGetTokenT<edm::SimTrackContainer> tokSimTrk_;
   edm::EDGetTokenT<edm::SimVertexContainer> tokSimVtx_;
 
-  TH1D* h_nETLPrimary_;
-  TH1D* h_timeSpreadETLPrimary_;
-  TH1D* h_spaceSpreadDrLocalETLPrimary_;
-  TH1D* h_spaceSpreadDzLocalETLPrimary_;
-  TH2D* h_timeVsDrLocalETLPrimary_;
+  TH1D* h_nETLPrimaryPdgMatched_;
+  TH1D* h_timeSpreadETLPrimaryPdgMatched_;
+  TH1D* h_backFracPerEventPrimaryETL_PdgMatched_;
+
+  // Global counters across all events (primary-associated + PDG exact match only)
+  unsigned long long totalETLHitsPrimaryPdgMatchedAll_ = 0;
+  unsigned long long totalETLHitsPrimaryPdgMatchedFromBack_ = 0;
+  unsigned long long totalEvents_ = 0;
 };
 
 MTDSimHitPrimaryAnalyzer::MTDSimHitPrimaryAnalyzer(const edm::ParameterSet& iConfig) {
@@ -59,70 +56,74 @@ MTDSimHitPrimaryAnalyzer::MTDSimHitPrimaryAnalyzer(const edm::ParameterSet& iCon
   tokSimVtx_ = consumes<edm::SimVertexContainer>(iConfig.getParameter<edm::InputTag>("simVertices"));
 
   edm::Service<TFileService> fs;
-  h_nETLPrimary_ = fs->make<TH1D>(
-      "h_nETLPrimary",
-      "Primary-track ETL PSimHit multiplicity;N_{ETL}^{primary};Tracks",
+  h_nETLPrimaryPdgMatched_ = fs->make<TH1D>(
+      "h_nETLPrimaryPdgMatched",
+      "Primary-associated ETL PSimHit multiplicity per primary SimTrack (PDG exact match);N_{ETL}^{primary-associated,PDG};Tracks",
       20, -0.5, 19.5);
 
-  h_timeSpreadETLPrimary_ = fs->make<TH1D>(
-      "h_timeSpreadETLPrimary",
-      "Primary-track ETL time spread;#Delta t=t_{max}-t_{min} [ns];Tracks with N_{ETL}#geq1",
+  h_timeSpreadETLPrimaryPdgMatched_ = fs->make<TH1D>(
+      "h_timeSpreadETLPrimaryPdgMatched",
+      "Primary-associated ETL time spread (PDG exact match);#Delta t=t_{max}-t_{min} [ns];Tracks with N_{ETL}#geq1",
       200, 0.0, 10.0);
 
-  h_spaceSpreadDrLocalETLPrimary_ = fs->make<TH1D>(
-      "h_spaceSpreadDrLocalETLPrimary",
-      "Primary-track ETL local-space spread proxy;max #Delta r_{local} from first hit;Tracks with N_{ETL}#geq1",
-      200, 0.0, 50.0);
-
-  h_spaceSpreadDzLocalETLPrimary_ = fs->make<TH1D>(
-      "h_spaceSpreadDzLocalETLPrimary",
-      "Primary-track ETL local-z spread proxy;#Delta z_{local}=z_{max}-z_{min};Tracks with N_{ETL}#geq1",
-      200, 0.0, 20.0);
-
-  h_timeVsDrLocalETLPrimary_ = fs->make<TH2D>(
-      "h_timeVsDrLocalETLPrimary",
-      "Primary-track ETL time vs local-space spread proxy;#Delta t [ns];max #Delta r_{local}",
-      200, 0.0, 10.0, 200, 0.0, 50.0);
+  h_backFracPerEventPrimaryETL_PdgMatched_ = fs->make<TH1D>(
+      "h_backFracPerEventPrimaryETL_PdgMatched",
+      "Event-level ETL from-back fraction (primary-associated, PDG exact match);N_{ETL,fromBack}^{assoc,PDG}/N_{ETL,all}^{assoc,PDG};Events",
+      110, 0.0, 1.1);
 }
 
 void MTDSimHitPrimaryAnalyzer::analyze(const edm::Event& iEvent, const edm::EventSetup&) {
+  ++totalEvents_;
+
   edm::Handle<edm::SimTrackContainer> hTrk;
   edm::Handle<std::vector<PSimHit>> hETL;
   edm::Handle<std::vector<PSimHit>> hBTL;
 
   iEvent.getByToken(tokSimTrk_, hTrk);
   iEvent.getByToken(tokETL_, hETL);
-  iEvent.getByToken(tokBTL_, hBTL);  // keep interface intentionally (not counted)
+  iEvent.getByToken(tokBTL_, hBTL);  // intentionally unused
 
-  // trackId -> (pdgId, isPrimaryApprox)
+  // SimTrack ID -> (PDG, isPrimaryApprox)
   std::unordered_map<unsigned, std::pair<int, bool>> trkInfo;
   trkInfo.reserve(hTrk->size());
 
-  // primary trackId -> accumulators (ETL only)
-  // IMPORTANT: pre-create all primary tracks so nETL=0 tracks are included.
+  // primary SimTrack ID -> accumulators (PDG-matched ETL hits only)
   std::unordered_map<unsigned, TrackAccum> acc;
   acc.reserve(hTrk->size());
 
   for (auto const& trk : *hTrk) {
-    bool isPrimary = (trk.genpartIndex() >= 0);  // particle gun下通常够用
-    const unsigned tid = trk.trackId();
+    const bool isPrimary = (trk.genpartIndex() >= 0);  // particle gun场景通常够用
+    const unsigned tid = trk.trackId();                // SimTrack ID
     trkInfo.emplace(tid, std::make_pair(trk.type(), isPrimary));
     if (isPrimary) {
-      acc.emplace(tid, TrackAccum{});  // create even if it gets zero ETL hits
+      acc.emplace(tid, TrackAccum{});  // include nETL=0 tracks
     }
   }
 
-  // Fill ETL hit information for primary-assigned tracks
-  for (auto const& hit : *hETL) {
-    unsigned tid = hit.trackId();
-    auto it = trkInfo.find(tid);
-    if (it == trkInfo.end()) continue;
-    if (!it->second.second) continue;  // only primary (current definition)
+  // Event-level counters (ONLY PDG exact-match sample)
+  unsigned long long nETLHitsPrimaryPdgMatchedAll = 0;
+  unsigned long long nETLHitsPrimaryPdgMatchedFromBack = 0;
 
-    auto ait = acc.find(tid);
-    if (ait == acc.end()) continue;  // defensive (should not happen)
+  // Fill ETL hit info (primary-associated + PDG exact-match only)
+  for (auto const& hit : *hETL) {
+    const unsigned tidOrig = hit.originalTrackId();  // decoded base ID for matching SimTrack
+    const unsigned tidOff  = hit.offsetTrackId();    // offset category (e.g. 4 = ETL from-back)
+
+    auto it = trkInfo.find(tidOrig);
+    if (it == trkInfo.end()) continue;
+
+    const int primaryPdg = it->second.first;
+    const bool isPrimary = it->second.second;
+    if (!isPrimary) continue;  // primary-associated only
+
+    const int hitPdg = hit.particleType();
+    if (hitPdg != primaryPdg) continue;  // <-- only keep PDG exact match version
+
+    auto ait = acc.find(tidOrig);
+    if (ait == acc.end()) continue;  // defensive
     auto& a = ait->second;
 
+    // Track-level accumulators (now for PDG-matched sample only)
     a.nETL++;
     a.hasHit = true;
 
@@ -130,63 +131,99 @@ void MTDSimHitPrimaryAnalyzer::analyze(const edm::Event& iEvent, const edm::Even
     a.tMin = std::min(a.tMin, t);
     a.tMax = std::max(a.tMax, t);
 
-    // local midpoint proxy (entry/exit)
-    const auto& pIn  = hit.entryPoint();
-    const auto& pOut = hit.exitPoint();
-    const double x = 0.5 * (pIn.x() + pOut.x());
-    const double y = 0.5 * (pIn.y() + pOut.y());
-    const double z = 0.5 * (pIn.z() + pOut.z());
-
-    if (!a.hasRefPos) {
-      a.x0 = x; a.y0 = y; a.z0 = z;
-      a.hasRefPos = true;
+    // Event-level counters
+    ++nETLHitsPrimaryPdgMatchedAll;
+    if (tidOff == MtdHitCategory::k_idETLfromBack) {
+      ++nETLHitsPrimaryPdgMatchedFromBack;
     }
-
-    const double dr = std::sqrt((x - a.x0) * (x - a.x0) + (y - a.y0) * (y - a.y0));
-    a.maxDrLocalFromFirst = std::max(a.maxDrLocalFromFirst, dr);
-    a.zLocalMin = std::min(a.zLocalMin, z);
-    a.zLocalMax = std::max(a.zLocalMax, z);
   }
+
+  // Accumulate global counters
+  totalETLHitsPrimaryPdgMatchedAll_ += nETLHitsPrimaryPdgMatchedAll;
+  totalETLHitsPrimaryPdgMatchedFromBack_ += nETLHitsPrimaryPdgMatchedFromBack;
 
   edm::LogPrint("MTDSimHitPrimaryAnalyzer")
       << "Run " << iEvent.id().run() << " Event " << iEvent.id().event()
-      << " : primary-track ETL simhit multiplicity + spreads (trackId: pdgId, nETL, dT[ns], dRlocal, dZlocal)";
+      << " : primary-associated ETL simhit multiplicity + time spread (PDG exact match only)"
+      << " (trackId: pdgId, nETL, dT[ns])";
 
   if (acc.empty()) {
-    edm::LogPrint("MTDSimHitPrimaryAnalyzer") << "  (no primary tracks found by current definition)";
-    return;
-  }
+    edm::LogPrint("MTDSimHitPrimaryAnalyzer")
+        << "  (no primary SimTracks found by current definition: genpartIndex()>=0)";
+  } else {
+    for (auto const& kv : acc) {
+      const unsigned tid = kv.first;  // SimTrack ID
+      const auto& a = kv.second;
+      const int pdg = trkInfo[tid].first;
 
-  for (auto const& kv : acc) {
-    const unsigned tid = kv.first;
-    const auto& a = kv.second;
-    const int pdg = trkInfo[tid].first;
+      // Includes nETL=0 primary tracks in the PDG-matched sample
+      h_nETLPrimaryPdgMatched_->Fill(a.nETL);
 
-    // Multiplicity includes nETL=0 primaries (important!)
-    h_nETLPrimary_->Fill(a.nETL);
+      if (a.hasHit) {
+        const double dT = a.tMax - a.tMin;
+        h_timeSpreadETLPrimaryPdgMatched_->Fill(dT);
 
-    if (a.hasHit) {
-      const double dT = a.tMax - a.tMin;
-      const double dRlocal = a.maxDrLocalFromFirst;
-      const double dZlocal = a.hasRefPos ? (a.zLocalMax - a.zLocalMin) : 0.0;
-
-      h_timeSpreadETLPrimary_->Fill(dT);
-      h_spaceSpreadDrLocalETLPrimary_->Fill(dRlocal);
-      h_spaceSpreadDzLocalETLPrimary_->Fill(dZlocal);
-      h_timeVsDrLocalETLPrimary_->Fill(dT, dRlocal);
-
-      edm::LogPrint("MTDSimHitPrimaryAnalyzer")
-          << "  trackId=" << tid << " pdgId=" << pdg
-          << " nETL=" << a.nETL
-          << " dT=" << dT
-          << " dRlocal=" << dRlocal
-          << " dZlocal=" << dZlocal;
-    } else {
-      edm::LogPrint("MTDSimHitPrimaryAnalyzer")
-          << "  trackId=" << tid << " pdgId=" << pdg
-          << " nETL=0 (no ETL simhits)";
+        edm::LogPrint("MTDSimHitPrimaryAnalyzer")
+            << "  trackId=" << tid << " pdgId=" << pdg
+            << " nETL=" << a.nETL
+            << " dT=" << dT;
+      } else {
+        edm::LogPrint("MTDSimHitPrimaryAnalyzer")
+            << "  trackId=" << tid << " pdgId=" << pdg
+            << " nETL=0 (no ETL simhits in PDG-matched sample)";
+      }
     }
   }
+
+  // Event-level ETL from-back fraction (PDG exact-match sample only)
+  if (nETLHitsPrimaryPdgMatchedAll > 0) {
+    const double fracBackPdg =
+        static_cast<double>(nETLHitsPrimaryPdgMatchedFromBack) /
+        static_cast<double>(nETLHitsPrimaryPdgMatchedAll);
+
+    h_backFracPerEventPrimaryETL_PdgMatched_->Fill(fracBackPdg);
+
+    edm::LogPrint("MTDSimHitPrimaryAnalyzer")
+        << "  [ETL primary-associated + PDG exact-match hits] total="
+        << nETLHitsPrimaryPdgMatchedAll
+        << " fromBack(offset=" << MtdHitCategory::k_idETLfromBack << ")="
+        << nETLHitsPrimaryPdgMatchedFromBack
+        << " fraction=" << fracBackPdg;
+  } else {
+    edm::LogPrint("MTDSimHitPrimaryAnalyzer")
+        << "  [ETL primary-associated + PDG exact-match hits] total=0 fromBack=0 fraction=nan";
+  }
+}
+
+void MTDSimHitPrimaryAnalyzer::endJob() {
+  edm::LogPrint("MTDSimHitPrimaryAnalyzer")
+      << "================ Final summary (all events) ================";
+
+  edm::LogPrint("MTDSimHitPrimaryAnalyzer")
+      << "Processed events = " << totalEvents_;
+
+  edm::LogPrint("MTDSimHitPrimaryAnalyzer")
+      << "[Primary-associated + PDG exact-match] total ETL hits = "
+      << totalETLHitsPrimaryPdgMatchedAll_;
+
+  edm::LogPrint("MTDSimHitPrimaryAnalyzer")
+      << "[Primary-associated + PDG exact-match] ETL from-back hits (offset="
+      << MtdHitCategory::k_idETLfromBack << ") = "
+      << totalETLHitsPrimaryPdgMatchedFromBack_;
+
+  if (totalETLHitsPrimaryPdgMatchedAll_ > 0) {
+    const double frac =
+        static_cast<double>(totalETLHitsPrimaryPdgMatchedFromBack_) /
+        static_cast<double>(totalETLHitsPrimaryPdgMatchedAll_);
+    edm::LogPrint("MTDSimHitPrimaryAnalyzer")
+        << "[Primary-associated + PDG exact-match] global ETL from-back fraction = " << frac;
+  } else {
+    edm::LogPrint("MTDSimHitPrimaryAnalyzer")
+        << "[Primary-associated + PDG exact-match] global ETL from-back fraction = nan (no ETL hits)";
+  }
+
+  edm::LogPrint("MTDSimHitPrimaryAnalyzer")
+      << "============================================================";
 }
 
 DEFINE_FWK_MODULE(MTDSimHitPrimaryAnalyzer);
